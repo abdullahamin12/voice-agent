@@ -1,0 +1,83 @@
+--- Voice Agent Speed Test ---
+Question 1: What is speed?
+  TTFT: 48.19 ms
+  Speed: 269.76 tokens/sec
+  First token id: 16733
+----------------------------------------
+Question 2: How do I say hello in Italian?
+  TTFT: 63.44 ms
+  Speed: 267.97 tokens/sec
+  First token id: 818
+----------------------------------------
+Question 3: What is the weather today?
+  TTFT: 48.76 ms
+  Speed: 307.65 tokens/sec
+  First token id: 236777
+----------------------------------------
+Question 4: Summarize the word computer in one sentence.
+  TTFT: 48.26 ms
+  Speed: 372.95 tokens/sec
+  First token id: 236776
+----------------------------------------
+Question 5: What is the fastest land animal?
+  TTFT: 48.55 ms
+  Speed: 329.55 tokens/sec
+  First token id: 818
+----------------------------------------
+Average prompt speed over 5 questions: 309.57 tokens/sec
+Average TTFT over 5 questions: 51.44 ms
+(voice-agent-pipeline) nauyan@nauyan:~/voice-agent-pipeline$ 
+
+
+
+for voice one 
+(voice-agent-pipeline) nauyan@nauyan:~/voice-agent-pipeline$ python /home/nauyan/voice-agent-pipeline/voice_speed.py
+Loading specialized Gemma 4 Multimodal Processor...
+Loading Multimodal weights onto RTX 3090 (BF16 mode)...
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████| 2076/2076 [00:02<00:00, 829.64it/s]
+Loading phone recording: /home/nauyan/Downloads/test...
+/home/nauyan/voice-agent-pipeline/voice_speed.py:69: UserWarning: PySoundFile failed. Trying audioread instead.
+  audio_array, sampling_rate = librosa.load(audio_file_path, sr=16000)
+/home/nauyan/voice-agent-pipeline/.venv/lib/python3.10/site-packages/librosa/core/audio.py:184: FutureWarning: librosa.core.audio.__audioread_load
+        Deprecated as of librosa version 0.10.0.
+        It will be removed in librosa version 1.0.
+  y, sr_native = __audioread_load(path, offset, duration, dtype)
+Warming up GPU cache...
+
+--- Starting Audio Streaming Benchmark ---
+
+--- Model Transcription Output ---
+You are my assistant tell me what should I do today
+----------------------------------
+
+--- True Generation Metrics ---
+Audio Context Duration     : 3.60 seconds
+True Time to First Token   : 72.31 ms
+--------------------------------
+(voice-agent-pipeline) nauyan@nauyan:~/voice-agent-pipeline$ python /home/nauyan/voice-agent-pipeline/voice_speed.py
+Loading specialized Gemma 4 Multimodal Processor...
+Loading Multimodal weights onto RTX 3090 (BF16 mode)...
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████| 2076/2076 [00:02<00:00, 834.49it/s]
+Loading phone recording: /home/nauyan/Downloads/test...
+/home/nauyan/voice-agent-pipeline/voice_speed.py:69: UserWarning: PySoundFile failed. Trying audioread instead.
+  audio_array, sampling_rate = librosa.load(audio_file_path, sr=16000)
+/home/nauyan/voice-agent-pipeline/.venv/lib/python3.10/site-packages/librosa/core/audio.py:184: FutureWarning: librosa.core.audio.__audioread_load
+        Deprecated as of librosa version 0.10.0.
+        It will be removed in librosa version 1.0.
+  y, sr_native = __audioread_load(path, offset, duration, dtype)
+Warming up GPU cache...
+
+--- Starting Audio Streaming Benchmark ---
+
+--- Model Transcription Output ---
+Sure, I can help with that. To give you the best suggestions, could you tell me a little more about what you're in the mood for? For example, are you looking for something relaxing, adventurous, productive, or social?
+----------------------------------
+
+--- True Generation Metrics ---
+Audio Context Duration     : 3.60 seconds
+True Time to First Token   : 72.77 ms
+--------------------------------
+(voice-agent-pipeline) nauyan@nauyan:~/voice-agent-pipeli
+(voice-agent-pipeline) nauyan@nauyan:~/voice-agent-pipeline$ 

@@ -1,7 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_ID = "google/gemma-4-E4B-it"
-SAVE_DIR = "./models/gemma-4-E4B-it"
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+SAVE_DIR = "./models/Qwentts"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
