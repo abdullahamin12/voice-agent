@@ -1,44 +1,46 @@
 """
-Persistent Qwen3-TTS worker -- STREAMING version.
-Runs in venv-voice (transformers==4.57.3).
+Persistent Qwen3-TTS worker -- STREAMING version, base64-PCM protocol.
+Runs in venv-voice.
 
-Why this changed: the old version fully drained
-model.generate_custom_voice_streaming() into one big buffer, wrote ONE wav
-file, and only then printed its path. That throws away the whole point of
-the streaming API -- the CUDA-graph backend's own benchmarks show ~150-450ms
-time-to-first-audio (152-159ms on an RTX 4090, ~415ms on a much weaker RTX
-3050 -- confirmed from the library's own README/blog), but the old code made
-you wait for the ENTIRE reply to finish synthesizing before a single word
-played.
+=== WHAT CHANGED IN THIS PASS, AND WHY (verified against the real
+faster-qwen3-tts README, not guessed) ===
 
-Protocol (stdin -> stdout), one line per message:
-  IN:  {"text": "...", "instruct": "warm and reassuring"}   (JSON, one line)
-  OUT: one line per audio chunk, printed the moment that chunk is ready --
-       the path to a small wav file holding just that chunk. The caller
-       should start playing chunk 1 as soon as it arrives instead of
-       waiting for the rest.
+1. FIXED BUG: non_streaming_mode=False -> non_streaming_mode=None.
+   The library's own README is explicit about this: `non_streaming_mode`
+   uses `None` as a sentinel meaning "keep upstream's default for this
+   method". For `generate_custom_voice_streaming` specifically, that
+   upstream default is **True**. The previous code passed `False` outright,
+   which *overrides* the sentinel and forces the model into the wrong mode
+   for the CustomVoice model type -- exactly the divergence the old code's
+   own comment flagged as unverified. It's now fixed to match the tested
+   upstream default.
+
+2. NO MORE TEMP WAV FILES. The old version wrote every audio chunk to a
+   NamedTemporaryFile on disk, printed the path, and left the caller to
+   read+delete it -- except nothing ever deleted it, so temp files leaked
+   for the life of the process, and every chunk paid for a disk round-trip
+   that the streaming API's whole point was to avoid. This version
+   base64-encodes the raw int16 PCM bytes directly into the stdout protocol
+   line. No disk I/O, no leftover files, no read races.
+
+Protocol (stdin -> stdout), one JSON line per message:
+  IN:  {"text": "...", "instruct": "warm and reassuring"}
+  OUT: one line per audio chunk, the instant it's ready:
+       {"audio_b64": "<base64 int16 PCM mono>", "sample_rate": 24000}
   OUT: "<<END>>" once all chunks for that request have been sent.
-  OUT: "<<ERROR>> <message>" if synthesis failed for that request (still
-       followed by "<<END>>" so the caller's read loop always terminates).
+  OUT: "<<ERROR>> <message>" if synthesis failed (still followed by
+       "<<END>>" so the caller's read loop always terminates).
 
 `instruct` is a real Qwen3-TTS CustomVoice feature for natural-language
-control of emotion/tone/prosody -- confirmed CustomVoice (not just
-VoiceDesign) supports a speaker + style-instruction combination.
-native_brain.py fills it in from the model's own TONE field, which is what
-makes replies sound expressive instead of flat and monotone.
-
-NOTE: non_streaming_mode=False below diverges from CustomVoice's documented
-upstream default (True). Benchmarks show near-identical speed either way --
-if voice quality/behavior seems off, try passing non_streaming_mode=None
-(the default) instead.
+control of emotion/tone/prosody. native_brain.py fills it in from the
+model's own TONE field.
 """
 
+import base64
 import json
 import sys
-import tempfile
 
 import numpy as np
-import soundfile as sf
 import torch
 from faster_qwen3_tts import FasterQwen3TTS
 
@@ -54,7 +56,7 @@ CHUNK_SIZE = 8
 
 
 def log(msg: str) -> None:
-    # stderr only -- stdout is reserved for the wav-path protocol
+    # stderr only -- stdout is reserved for the JSON protocol
     print(msg, file=sys.stderr, flush=True)
 
 
@@ -63,21 +65,24 @@ model = FasterQwen3TTS.from_pretrained(
     MODEL_ID,
     device="cuda",
     dtype=torch.bfloat16,
-    attn_implementation="eager",  # repo's own default -- see comments in the original file
-    backend="torch",  # CUDA-graph fast path (matches: no qwentts-cpp-python installed = no ggml)
+    attn_implementation="eager",  # repo's own default
+    backend="torch",  # CUDA-graph fast path
 )
 log("✅ Qwen3-TTS ready (streaming mode).")
 
 
 def synthesize_streaming(text: str, instruct: str | None):
-    """Generator: yields a wav file path for each audio chunk as it's produced."""
+    """Generator: yields (pcm16_bytes, sample_rate) for each audio chunk."""
     chunk_iter = model.generate_custom_voice_streaming(
         text=text,
         speaker=SPEAKER,
         language=LANGUAGE,
         instruct=instruct or None,
         chunk_size=CHUNK_SIZE,
-        non_streaming_mode=False,
+        # None = "use the library's own tested default for this method"
+        # (True, for CustomVoice) -- see note (1) above. Do NOT hardcode
+        # False here; that was the bug.
+        non_streaming_mode=None,
     )
     for wav_chunk, sr, _timing in chunk_iter:
         if hasattr(wav_chunk, "detach"):
@@ -86,11 +91,8 @@ def synthesize_streaming(text: str, instruct: str | None):
         if wav_chunk.size == 0:
             continue
         wav_chunk = np.clip(wav_chunk, -1.0, 1.0)
-        tmp = tempfile.NamedTemporaryFile(
-            prefix="agent_chunk_", suffix=".wav", delete=False
-        )
-        sf.write(tmp.name, wav_chunk, sr, format="WAV")
-        yield tmp.name
+        pcm16 = (wav_chunk * 32767.0).astype(np.int16)
+        yield pcm16.tobytes(), sr
 
 
 log("🎙️  Worker loop ready, waiting for requests on stdin...")
@@ -115,8 +117,12 @@ try:
 
         try:
             chunk_count = 0
-            for wav_path in synthesize_streaming(text, instruct):
-                print(wav_path, flush=True)
+            for pcm_bytes, sr in synthesize_streaming(text, instruct):
+                out = {
+                    "audio_b64": base64.b64encode(pcm_bytes).decode("ascii"),
+                    "sample_rate": sr,
+                }
+                print(json.dumps(out), flush=True)
                 chunk_count += 1
             if chunk_count == 0:
                 log("❌ TTS produced no audio chunks")

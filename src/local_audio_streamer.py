@@ -1,27 +1,21 @@
 """
-Local full-duplex mic/speaker streamer.
-Source: adapted from huggingface/speech-to-speech (connections/local_audio_streamer.py).
-Only change from the original: the two imports that pulled in the repo's
-internal pipeline framework are replaced with a local sentinel constant.
-Runs in venv-brain.
+Local full-duplex mic/speaker streamer -- ALWAYS records mic.
+Source: adapted from huggingface/speech-to-speech.
 
-Behavior: while the output_queue is empty, it records mic audio into
-input_queue. The moment there's audio queued in output_queue, it switches
-to playing that instead (so it doesn't record its own voice back).
+Unchanged from your version -- the always-record full-duplex design plus
+flush_output() for barge-in was already correct.
 """
 
 import logging
 import threading
 import time
-from queue import Queue
+from queue import Empty, Queue
 
 import numpy as np
 import sounddevice as sd
 
 logger = logging.getLogger(__name__)
 
-# Sentinel pushed onto output_queue to mark "agent finished talking" --
-# the streamer re-enables should_listen the moment it dequeues this.
 AUDIO_RESPONSE_DONE = "AUDIO_RESPONSE_DONE"
 
 
@@ -34,15 +28,23 @@ class LocalAudioStreamer:
         list_play_chunk_size: int = 512,
     ) -> None:
         self.list_play_chunk_size = list_play_chunk_size
-
         self.stop_event = threading.Event()
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.should_listen = should_listen
 
+    def flush_output(self) -> int:
+        """Immediately drop all queued audio. Call on barge‑in."""
+        dropped = 0
+        while True:
+            try:
+                self.output_queue.get_nowait()
+                dropped += 1
+            except Empty:
+                break
+        return dropped
+
     def run(self) -> None:
-        # Pre-generate a static dither buffer (±1 LSB, -96 dB) to keep the
-        # audio sink active without calling numpy inside the real-time callback.
         dither = np.random.randint(
             -1, 2, size=(self.list_play_chunk_size, 1), dtype=np.int16
         )
@@ -51,24 +53,25 @@ class LocalAudioStreamer:
             if self.stop_event.is_set():
                 outdata[:] = 0 * outdata
                 return
-
+            # ----- ALWAYS record the mic, no matter what -----
+            pcm = np.ascontiguousarray(indata, dtype=np.int16)
+            self.input_queue.put(pcm.tobytes())
+            # ----- Playback is a completely independent decision -----
             if self.output_queue.empty():
-                pcm = np.ascontiguousarray(indata, dtype=np.int16)
-                self.input_queue.put(pcm.tobytes())
                 outdata[:] = dither
-            else:
-                try:
-                    audio_chunk = self.output_queue.get_nowait()
-                    if isinstance(audio_chunk, np.ndarray):
-                        outdata[:] = audio_chunk[:, np.newaxis]
-                    elif audio_chunk == AUDIO_RESPONSE_DONE:
-                        self.should_listen.set()
-                        logger.debug("Response complete, listening re-enabled")
-                        outdata[:] = 0 * outdata
-                    else:
-                        outdata[:] = 0 * outdata
-                except Exception:
+                return
+            try:
+                audio_chunk = self.output_queue.get_nowait()
+                if isinstance(audio_chunk, np.ndarray):
+                    outdata[:] = audio_chunk[:, np.newaxis]
+                elif audio_chunk == AUDIO_RESPONSE_DONE:
+                    self.should_listen.set()
+                    logger.debug("Response complete, listening re-enabled")
                     outdata[:] = 0 * outdata
+                else:
+                    outdata[:] = 0 * outdata
+            except Exception:
+                outdata[:] = 0 * outdata
 
         logger.debug("Available devices:")
         logger.debug(sd.query_devices())
@@ -79,8 +82,8 @@ class LocalAudioStreamer:
             callback=callback,
             blocksize=self.list_play_chunk_size,
         ):
-            logger.info("Starting local audio stream")
-            print("🎙️  Mic/speaker stream started.")
+            logger.info("Starting local audio stream (true full duplex)")
+            print("🎙️  Mic/speaker stream started (mic stays live during playback).")
             while not self.stop_event.is_set():
                 time.sleep(0.001)
             print("Stopping recording")

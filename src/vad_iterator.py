@@ -2,7 +2,9 @@
 Silero VAD stream wrapper.
 Source: adapted from huggingface/speech-to-speech (VAD/vad_iterator.py),
 which itself adapts https://github.com/snakers4/silero-vad
-Zero framework dependencies -- only torch. Runs in venv-brain.
+Zero framework dependencies -- only torch.
+
+Unchanged -- this logic is solid and independent of the Gemma/Qwen fixes.
 
 Feed it 512-sample (32ms @ 16kHz) float32 chunks one at a time via __call__.
 Returns None while still listening/silent. Returns the full list of
@@ -23,16 +25,6 @@ class VADIterator:
         min_silence_duration_ms: int = 500,
         speech_pad_ms: int = 30,
     ) -> None:
-        """
-        model: preloaded Silero VAD model (torch.hub.load("snakers4/silero-vad", "silero_vad"))
-        threshold: speech probability above this counts as speech (0.5 is a good default)
-        sampling_rate: 8000 or 16000 only
-        min_silence_duration_ms: how long silence must persist before we
-            declare "user is done talking" -- this is your end-of-turn latency knob.
-            Lower = snappier but risks cutting people off. 400-600ms is a good MVP range.
-        speech_pad_ms: keep this much audio *before* the detected speech start,
-            so we don't clip the first syllable
-        """
         self.model = model
         self.threshold = threshold
         self.sampling_rate = sampling_rate

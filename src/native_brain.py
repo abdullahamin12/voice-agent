@@ -1,41 +1,68 @@
 """
 Gemma-4-E4B native audio brain -- STREAMING + MEMORY + SEARCH version.
-Runs in venv-brain (transformers>=5.5.0).
+Runs in venv-brain.
 
-What changed vs. the earlier version, and why:
+=== WHAT CHANGED IN THIS PASS, AND WHY (verified against Google's own docs
+and real transformers source, not guessed) ===
 
-  - STREAMING GENERATION. The old version called model.generate() and blocked
-    until the entire reply existed before returning anything. This version
-    uses TextIteratorStreamer in a background thread and yields each
-    completed SENTENCE the moment it's ready, so run_agent.py can hand it to
-    the TTS worker immediately instead of waiting for the whole answer.
+1. transformers>=5.10.1, not >=5.5.0.
+   Google's own Gemma 4 audio guide (ai.google.dev/gemma/docs/capabilities/audio)
+   and function-calling guide both pin `pip install "transformers>=5.10.1"`.
+   5.5.0 predates the Gemma4 model integration landing in transformers and
+   will not import Gemma4Processor at all.
 
-  - STRUCTURED OUTPUT (LOG / TONE / SEARCH / REPLY). One generation pass now
-    does four jobs at once instead of needing separate round trips:
-      LOG    -- a one-line memory note (what the user said)
-      TONE   -- 2-4 words fed to Qwen3-TTS's `instruct` parameter, which is
-                a real feature of the CustomVoice model for controlling
-                emotion/prosody -- this is what makes replies sound
-                expressive instead of flat.
-      SEARCH -- a query string, or NONE, letting the model ask for current
-                information instead of guessing.
-      REPLY  -- the actual words to speak.
+2. ONE-STEP generation input instead of two.
+   The previous version called `processor.apply_chat_template(..., tokenize=False)`
+   to get a text string, then called `processor(text=prompt, audio=audios,
+   sampling_rate=sampling_rate, ...)` by hand. That second call's `sampling_rate`
+   kwarg was never confirmed against Gemma4's actual audio feature extractor
+   signature -- and checking the real extractor
+   (transformers/models/gemma4/*), its `__call__` takes `raw_speech` with NO
+   `sampling_rate` parameter (Gemma 4 always assumes pre-resampled 16kHz
+   mono float32, per the model card's own audio encoding section). Passing
+   an unexpected kwarg like that is a plausible source of a hard crash on
+   every audio turn.
+   The documented, working pattern (Google's own audio-capabilities guide,
+   and a hands-on community walkthrough that runs this exact call) is to put
+   the raw numpy audio array straight into the message content and call:
+       processor.apply_chat_template(messages, tokenize=True,
+                                      add_generation_prompt=True,
+                                      return_dict=True, return_tensors="pt")
+   which returns a ready-to-generate() dict and handles audio feature
+   extraction internally. That's what this version does -- for both the
+   audio-carrying first pass AND the text-only search follow-up pass, so
+   there's only one code path instead of two.
 
-  - LIGHTWEIGHT TEXT MEMORY. Conversation history persists as (log, reply)
-    text pairs, NOT raw audio. Keeping raw audio in history would make every
-    later turn slower (more audio tokens to re-encode on every single turn)
-    -- text is cheap and keeps latency flat across a long conversation.
+3. Sampling parameters now match Google's documented standard config for
+   Gemma 4 (`temperature=1.0, top_p=0.95, top_k=64`) instead of an
+   unsourced `temperature=0.7`.
 
-  - MAX_NEW_TOKENS raised from 100 to 260, and the old "keep it brief"
-    system-prompt instruction is gone. That combination is why answers felt
-    thin before. Streaming means the extra tokens no longer delay the first
-    spoken word -- they only add to total reply length.
+4. MAX_NEW_TOKENS raised 260 -> 640. This is almost certainly the actual
+   cause of "bot doesn't reply fully": one generation pass has to fit
+   LOG + TONE + SEARCH + the entire REPLY inside a single token budget, and
+   260 tokens barely covers a couple of sentences once the three header
+   fields are subtracted. Streaming means the extra tokens don't add to
+   time-to-first-audio, only to total length.
 
-KNOWN UNVERIFIED RISK: the search follow-up pass below calls the processor
-with NO audio input at all (text-only). Whether Gemma 4's multimodal
-processor accepts that cleanly hasn't been confirmed against your exact
-build -- this is the single most likely place to throw an error on first
-run of a search-triggering turn.
+5. `dtype=` instead of the now-deprecated `torch_dtype=` (confirmed: recent
+   transformers emits "`torch_dtype` is deprecated! Use `dtype` instead!").
+
+6. Model class fallback reordered. Both `AutoModelForImageTextToText` (used
+   consistently across the model card, the audio guide, and the
+   HF Transformers guide) and `AutoModelForMultimodalLM` (used in Google's
+   own function-calling guide) are real, currently-documented entry points
+   for Gemma 4 -- Google's docs are simply inconsistent about which one they
+   show. Trying both is correct defensive coding, not guesswork.
+
+7. Bounded conversation memory (was unbounded) so a long-running server
+   session doesn't grow the prompt forever.
+
+8. Audio is defensively clipped to Gemma 4's documented 30-second input cap
+   before it ever reaches the processor (see audio_utils.clip_to_max_audio_len).
+
+Everything else (LOG/TONE/SEARCH/REPLY structured output, per-sentence
+streaming, one-round web search) is unchanged in spirit -- just made to run
+on a corrected, source-verified inference path.
 
 >>> ADJUST MODEL_PATH BELOW to your actual local weights folder. <<<
 """
@@ -47,13 +74,17 @@ from typing import Iterator, Optional
 
 import torch
 
+from audio_utils import clip_to_max_audio_len
 from web_search import search_web
 
-# ---- CONFIG: change this to your actual absolute path ----
+# ---- CONFIG: change this to your actual absolute path ---
 MODEL_PATH = "/home/nauyan/voice-agent-pipeline/models/gemma-4-E4B-it"
 
-MAX_NEW_TOKENS = 260  # was 100 -- see note above
-MAX_MEMORY_TURNS = None  # text-only turns kept in context
+MAX_NEW_TOKENS = 640  # was 260 -- see note (4) above
+MAX_MEMORY_TURNS = 60  # was unbounded -- bounds prompt growth on long sessions
+
+# Google's documented standardized sampling config for Gemma 4 (all sizes).
+SAMPLING_KWARGS = dict(do_sample=True, temperature=1.0, top_p=0.95, top_k=64)
 
 SYSTEM_PROMPT = (
     "You are a warm, emotionally present voice companion having a real spoken "
@@ -75,6 +106,11 @@ SYSTEM_PROMPT = (
     "unless the user clearly just wants something quick.\n\n"
     "If SEARCH is not NONE, end your response right after the SEARCH line -- you'll "
     "be given the results and a chance to write REPLY afterward."
+    # NOTE: deliberately no "<|think|>" token here. Gemma 4's E2B/E4B variants
+    # are the documented exception that emits nothing extra when thinking is
+    # left disabled (larger variants would emit an empty <|channel>thought
+    # block even when disabled) -- so this system prompt correctly keeps
+    # thinking off with zero wasted tokens for this model size.
 )
 
 print(f"⏳ Loading offline multimodal brain from {MODEL_PATH}...")
@@ -82,18 +118,17 @@ print(f"⏳ Loading offline multimodal brain from {MODEL_PATH}...")
 from transformers import AutoProcessor, TextIteratorStreamer  # noqa: E402
 
 processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
-# Some multimodal processors nest the text tokenizer as .tokenizer, some are
-# usable directly -- fall back gracefully either way.
 tokenizer = getattr(processor, "tokenizer", processor)
 
-# Robustness: the exact audio-capable class name has moved around across
-# recent transformers dev builds. Try the officially documented one first,
-# fall back if your installed version names it differently.
+# Both class names below are real, currently-documented Gemma 4 entry points
+# (Google's own docs are simply inconsistent about which one they show on
+# which page) -- trying both, in the order most consistently documented, is
+# correct defensive loading, not a guess.
 model = None
 _load_errors = []
 for _cls_name in (
-    "AutoModelForMultimodalLM",
     "AutoModelForImageTextToText",
+    "AutoModelForMultimodalLM",
     "AutoModelForCausalLM",
 ):
     try:
@@ -103,7 +138,7 @@ for _cls_name in (
         model = _cls.from_pretrained(
             MODEL_PATH,
             device_map="cuda",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,  # `dtype=`, not deprecated `torch_dtype=`
             trust_remote_code=True,
             attn_implementation="sdpa",
         )
@@ -151,8 +186,9 @@ def _build_messages(audio_array) -> list:
     messages.append(
         {
             "role": "user",
-            # Text BEFORE audio in the content list -- this matches Google's
-            # own gemma-4-E4B-it model card example, confirmed current.
+            # Text BEFORE audio -- confirmed current in Gemma 4's own model
+            # card ("For optimal performance with multimodal inputs ...
+            # place Audio content after the text in your prompt").
             "content": [
                 {"type": "text", "text": "Listen to the following audio and respond."},
                 {"type": "audio", "audio": audio_array},
@@ -162,17 +198,17 @@ def _build_messages(audio_array) -> list:
     return messages
 
 
-def _generate_stream(messages, audios, sampling_rate: Optional[int]) -> Iterator[str]:
+def _generate_stream(messages: list) -> Iterator[str]:
     """Runs model.generate() in a background thread and yields decoded text
-    deltas as they're produced, instead of blocking until generation ends."""
-    prompt = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    proc_kwargs = dict(text=prompt, return_tensors="pt")
-    if audios is not None:
-        proc_kwargs["audio"] = audios
-        proc_kwargs["sampling_rate"] = sampling_rate
-    inputs = processor(**proc_kwargs).to("cuda")
+    deltas as they're produced. Single-step chat-template call -- see note
+    (2) in the module docstring for why the old two-step version was risky."""
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
 
     streamer = TextIteratorStreamer(
         tokenizer, skip_prompt=True, skip_special_tokens=True
@@ -181,9 +217,7 @@ def _generate_stream(messages, audios, sampling_rate: Optional[int]) -> Iterator
         **inputs,
         streamer=streamer,
         max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=True,
-        temperature=0.7,
-        repetition_penalty=1.1,
+        **SAMPLING_KWARGS,
     )
     thread = threading.Thread(
         target=model.generate, kwargs=generate_kwargs, daemon=True
@@ -194,7 +228,7 @@ def _generate_stream(messages, audios, sampling_rate: Optional[int]) -> Iterator
     thread.join()
 
 
-def _run_pass(messages, audios, sampling_rate) -> Iterator[tuple[str, str]]:
+def _run_pass(messages: list) -> Iterator[tuple[str, str]]:
     """Generator: yields (sentence, tone) for each REPLY sentence the moment
     it's ready. Its return value (accessed via StopIteration.value when
     driven manually) is (log, tone, search_query, full_reply_text)."""
@@ -203,7 +237,7 @@ def _run_pass(messages, audios, sampling_rate) -> Iterator[tuple[str, str]]:
     emitted_upto = 0
     log_text = tone_text = search_text = ""
 
-    for delta in _generate_stream(messages, audios, sampling_rate):
+    for delta in _generate_stream(messages):
         full_text += delta
 
         if reply_start is None:
@@ -245,17 +279,26 @@ def _run_pass(messages, audios, sampling_rate) -> Iterator[tuple[str, str]]:
 
 
 def respond_to_audio(audio_array, sampling_rate: int = 16000) -> Iterator[dict]:
-    """Main entry point.
+    """Main entry point. `audio_array` must already be float32 mono at
+    `sampling_rate` (16kHz) -- both run_agent.py and server.py resample
+    before calling this.
 
     Yields events as the reply is produced:
       {"type": "sentence", "text": ..., "tone": ...}  -- ready to speak now
       {"type": "done"}                                 -- reply finished
 
     Handles conversation memory and an optional one-round web search
-    internally, so the caller (run_agent.py) never has to know about either.
+    internally, so the caller never has to know about either.
     """
+    if sampling_rate != 16000:
+        raise ValueError(
+            "respond_to_audio expects 16kHz audio; resample before calling "
+            "(see audio_utils.resample_to_16k)."
+        )
+    audio_array = clip_to_max_audio_len(audio_array, sampling_rate)
+
     messages = _build_messages(audio_array)
-    gen = _run_pass(messages, audio_array, sampling_rate)
+    gen = _run_pass(messages)
 
     log_text = tone_text = search_query = reply_text = ""
     while True:
@@ -291,7 +334,7 @@ def respond_to_audio(audio_array, sampling_rate: int = 16000) -> Iterator[dict]:
 
         full = ""
         sentences: list[str] = []
-        for delta in _generate_stream(followup, None, None):
+        for delta in _generate_stream(followup):
             full += delta
             while True:
                 m = _SENTENCE_END.search(full)

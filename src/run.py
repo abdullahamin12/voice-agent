@@ -1,40 +1,15 @@
 """
-Terminal voice agent -- no network required except for the optional web
-search step, no Docker, no browser.
-Run with the venv-brain Python interpreter:
-    .venv-brain/bin/python run_agent.py
+Terminal voice agent -- BARGE-IN SUPPORT, base64-PCM TTS protocol.
 
-Loads Gemma-4-E4B locally, launches the Qwen3-TTS worker as a PERSISTENT
-subprocess in venv-voice (loaded once, kept warm), listens on your mic via
-Silero VAD, and speaks the reply back through your speakers.
-
-STREAMING PIPELINE -- this is the main fix vs. the earlier version:
-  1. native_brain.respond_to_audio() streams Gemma's reply out sentence by
-     sentence instead of generating the whole answer before anything
-     happens.
-  2. Each finished sentence is sent to the TTS worker immediately.
-  3. The TTS worker streams audio chunks back as they're generated (not as
-     one big file at the end) -- playback of chunk 1 starts while later
-     chunks, and later sentences, are still being produced.
-
-Previously NOTHING happened until BOTH the full LLM answer AND the full TTS
-clip existed -- that serial wait is what made the agent feel slow. LLM
-generation and TTS generation still share one GPU, so they're not truly
-running at the same instant, but this removes the "wait for 100% before
-starting anything" bottleneck, which is what actually drives the time you
-wait before you hear the first word.
-
-KNOWN COSMETIC ISSUE: each TTS chunk is resampled 24kHz->16kHz
-independently before queuing (correct math, via resample_poly), which can
-introduce faint clicks at chunk boundaries since each chunk is resampled in
-isolation rather than as one continuous stream. Not blocking -- just
-something to listen for.
-
->>> ADJUST THE TWO PATHS BELOW to match your actual folders. <<<
+Changed vs. the previous version:
+  - TTSClient now speaks tts_worker.py's new JSON/base64 protocol (no more
+    reading wav files off disk per chunk -- see tts_worker.py's docstring).
+  - Resampling / PCM<->float helpers moved to audio_utils.py so run_agent.py
+    and server.py don't duplicate them.
+Barge-in logic, VAD setup, and the overall turn-taking loop are unchanged.
 """
 
 import json
-import math
 import subprocess
 import threading
 import time as _time
@@ -42,37 +17,22 @@ from queue import Queue
 
 import numpy as np
 import torch
-import soundfile as sf
-from scipy.signal import resample_poly
 
 from vad_iterator import VADIterator
 from local_audio_streamer import LocalAudioStreamer, AUDIO_RESPONSE_DONE
+from audio_utils import (
+    SAMPLE_RATE,
+    int2float,
+    resample_to_16k,
+    b64_to_pcm16_bytes,
+)
 import native_brain
 
-# ---- CONFIG: change these two paths to your actual setup ----
+# ---- CONFIG ----
 VENV_VOICE_PYTHON = "/home/nauyan/voice-agent-pipeline/.venv-voice/bin/python"
 TTS_WORKER_SCRIPT = "/home/nauyan/voice-agent-pipeline/src/tts_worker.py"
 
-SAMPLE_RATE = 16000
-CHUNK_SIZE = 512  # samples per block (~32ms @ 16kHz) -- matches what Silero VAD expects
-
-
-def int2float(sound: np.ndarray) -> np.ndarray:
-    return sound.astype(np.float32) / 32768.0
-
-
-def resample_to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
-    """Qwen3-TTS's native output rate is not 16kHz, and the mic/speaker
-    stream below runs a single duplex line at 16kHz, so this conversion is
-    still needed. resample_poly is a lighter-weight, faster call per chunk
-    than librosa.resample was in the old per-reply version -- if you want
-    the model's full native audio quality with zero resampling, the next
-    step is splitting the duplex stream into an independent input stream
-    (16kHz, for VAD) and output stream (TTS's native rate)."""
-    if sr == SAMPLE_RATE:
-        return audio
-    g = math.gcd(sr, SAMPLE_RATE)
-    return resample_poly(audio, SAMPLE_RATE // g, sr // g).astype(np.float32)
+CHUNK_SIZE = 512
 
 
 class TTSClient:
@@ -84,9 +44,6 @@ class TTSClient:
     def speak_sentence(
         self, text: str, instruct: str | None, output_queue: Queue
     ) -> None:
-        """Sends one sentence and streams its audio chunks straight into
-        output_queue as they're produced -- does NOT wait for the whole
-        sentence's audio to finish synthesizing before queuing chunk 1."""
         request = json.dumps({"text": text, "instruct": instruct})
         self.proc.stdin.write(request + "\n")
         self.proc.stdin.flush()
@@ -94,7 +51,6 @@ class TTSClient:
         while True:
             line = self.proc.stdout.readline()
             if not line:
-                # worker died -- avoid spinning forever
                 print("❌ TTS worker pipe closed unexpectedly")
                 return
             line = line.strip()
@@ -106,19 +62,43 @@ class TTSClient:
                 print(f"❌ TTS worker: {line}")
                 continue
 
-            wav_path = line
             try:
-                audio, sr = sf.read(wav_path, dtype="float32")
+                chunk = json.loads(line)
+                pcm16 = b64_to_pcm16_bytes(chunk["audio_b64"])
+                sr = chunk["sample_rate"]
             except Exception as e:  # noqa: BLE001
-                print(f"❌ Could not read TTS chunk {wav_path}: {e}")
+                print(f"❌ Could not decode TTS chunk: {e}")
                 continue
-            audio = resample_to_16k(audio, sr)
-            audio_int16 = np.clip(audio * 32768, -32768, 32767).astype(np.int16)
+
+            audio_float = int2float(pcm16)
+            audio_float = resample_to_16k(audio_float, sr)
+            audio_int16 = (audio_float * 32768.0).clip(-32768, 32767).astype(np.int16)
             for i in range(0, len(audio_int16), CHUNK_SIZE):
                 block = audio_int16[i : i + CHUNK_SIZE]
                 if len(block) < CHUNK_SIZE:
                     block = np.pad(block, (0, CHUNK_SIZE - len(block)))
                 output_queue.put(block)
+
+
+def check_barge_in(
+    input_queue: Queue, barge_vad: VADIterator, min_speech_ms: int = 250
+) -> bool:
+    """Drain mic chunks and feed to the barge‑in VAD.
+    Returns True if the user has been speaking for >= min_speech_ms."""
+    from queue import Empty
+
+    MIN_SAMPLES = SAMPLE_RATE * min_speech_ms // 1000
+    while not input_queue.empty():
+        try:
+            raw_bytes = input_queue.get_nowait()
+        except Empty:
+            break
+        audio_int16 = np.frombuffer(raw_bytes, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        _ = barge_vad(torch.from_numpy(audio_float32))
+        if barge_vad.triggered and barge_vad.active_speech_samples >= MIN_SAMPLES:
+            return True
+    return False
 
 
 def main() -> None:
@@ -127,13 +107,11 @@ def main() -> None:
         [VENV_VOICE_PYTHON, "-u", TTS_WORKER_SCRIPT],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=None,  # its own logs print straight to your terminal
+        stderr=None,
         text=True,
         bufsize=1,
     )
 
-    # Fail loudly if the TTS worker died on launch (wrong path, import error,
-    # etc.) instead of silently continuing as if it were running.
     _time.sleep(1.0)
     if tts_proc.poll() is not None:
         raise RuntimeError(
@@ -146,11 +124,19 @@ def main() -> None:
     silero_model, _ = torch.hub.load(
         "snakers4/silero-vad", "silero_vad", trust_repo=True, skip_validation=True
     )
+
     vad = VADIterator(
         silero_model,
         threshold=0.5,
         sampling_rate=SAMPLE_RATE,
-        min_silence_duration_ms=500,  # end-of-turn latency knob -- lower = snappier, riskier
+        min_silence_duration_ms=500,
+    )
+
+    barge_vad = VADIterator(
+        silero_model,
+        threshold=0.7,
+        sampling_rate=SAMPLE_RATE,
+        min_silence_duration_ms=100,
     )
 
     input_queue: Queue = Queue()
@@ -191,20 +177,30 @@ def main() -> None:
                 for event in native_brain.respond_to_audio(
                     utterance, sampling_rate=SAMPLE_RATE
                 ):
+                    if check_barge_in(input_queue, barge_vad):
+                        print("🛑 Barge‑in detected – stopping reply.")
+                        streamer.flush_output()
+                        break
+
                     if event["type"] == "sentence" and event["text"]:
                         print(f"🤖 {event['text']}")
                         tts.speak_sentence(
                             event["text"], event.get("tone"), output_queue
                         )
+                        if check_barge_in(input_queue, barge_vad):
+                            print("🛑 Barge‑in during TTS – silencing.")
+                            streamer.flush_output()
+                            break
                         spoke_anything = True
 
                 if spoke_anything:
-                    output_queue.put(
-                        AUDIO_RESPONSE_DONE
-                    )  # streamer re-enables should_listen on dequeue
+                    output_queue.put(AUDIO_RESPONSE_DONE)
                 else:
                     should_listen.set()
-            except Exception as e:  # noqa: BLE001
+
+                barge_vad.reset_states()
+
+            except Exception as e:
                 print(f"❌ Brain error: {e}")
                 should_listen.set()
 
@@ -212,10 +208,6 @@ def main() -> None:
         print("\n👋 Stopping agent...")
         streamer.stop_event.set()
         tts_proc.terminate()
-        # Hard exit: sd.Stream's close() can hang on some Linux audio
-        # backends, which left the previous process alive and still
-        # holding ~15GB of VRAM. os._exit skips all cleanup and forces
-        # the OS/CUDA driver to reclaim everything immediately.
         import os
 
         os._exit(0)
