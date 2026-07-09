@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Voice Agent</title>
+
+<style>
+  :root {
+    --bg: #12151a;
+    --surface: #1a1f27;
+    --surface-line: #262c36;
+    --text: #e9e6df;
+    --text-muted: #848b96;
+    --amber: #e8a33d;     /* speaking */
+    --teal: #5fb8a8;      /* listening */
+    --violet: #9b8cf2;    /* thinking */
+    --danger: #d9685f;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 16px 16px;
+  }
+  .topbar {
+    width: 100%;
+    max-width: 640px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 28px;
+  }
+  .topbar input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--surface-line);
+    color: var(--text);
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 13px;
+  }
+  .topbar input:focus { outline: 1px solid var(--teal); }
+  button {
+    background: var(--surface);
+    border: 1px solid var(--surface-line);
+    color: var(--text);
+    padding: 9px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--teal); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.reset { color: var(--text-muted); }
+
+  .dial {
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
+    border: 2px solid var(--surface-line);
+    position: relative;
+    margin-bottom: 8px;
+    transition: border-color 0.4s ease, box-shadow 0.4s ease;
+  }
+  .dial .state-label {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  .dial.listening { border-color: var(--teal); box-shadow: 0 0 24px -6px var(--teal); }
+  .dial.listening .state-label { color: var(--teal); }
+  .dial.thinking { border-color: var(--violet); box-shadow: 0 0 24px -6px var(--violet); }
+  .dial.thinking .state-label { color: var(--violet); }
+  .dial.speaking { border-color: var(--amber); box-shadow: 0 0 24px -6px var(--amber); }
+  .dial.speaking .state-label { color: var(--amber); }
+
+  .meter {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 28px;
+    margin-bottom: 28px;
+  }
+  .meter .bar {
+    width: 4px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--surface-line);
+    transition: height 0.06s linear, background 0.15s linear;
+  }
+
+  .captions {
+    width: 100%;
+    max-width: 640px;
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 24px;
+  }
+  .line {
+    font-size: 15px;
+    line-height: 1.5;
+    color: var(--text);
+    padding: 10px 14px;
+    background: var(--surface);
+    border-radius: 10px;
+    border: 1px solid var(--surface-line);
+    max-width: 85%;
+    align-self: flex-start;
+  }
+  .footer-status {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    padding-top: 8px;
+    border-top: 1px solid var(--surface-line);
+    width: 100%;
+    max-width: 640px;
+  }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <input id="wsUrl" type="text" value="ws://192.168.18.16:8765" />
+    <button id="connectBtn">Connect</button>
+    <button id="resetBtn" class="reset" disabled>Reset conversation</button>
+  </div>
+
+  <div id="dial" class="dial">
+    <span id="stateLabel" class="state-label">offline</span>
+  </div>
+
+  <div id="meter" class="meter"></div>
+
+  <div id="captions" class="captions"></div>
+
+  <div id="footerStatus" class="footer-status">Not connected.</div>
+
+<script>
+// ============================================================
+//  CONFIGURATION
+// ============================================================
+const SAMPLE_RATE = 16000;        // target sample rate for the model
+const VAD_CHUNK_SIZE = 512;       // exact block size Silero expects
+const METER_BARS = 24;
+
+// ============================================================
+//  DOM REFERENCES
+// ============================================================
+const els = {
+  wsUrl: document.getElementById('wsUrl'),
+  connectBtn: document.getElementById('connectBtn'),
+  resetBtn: document.getElementById('resetBtn'),
+  dial: document.getElementById('dial'),
+  stateLabel: document.getElementById('stateLabel'),
+  meter: document.getElementById('meter'),
+  captions: document.getElementById('captions'),
+  footerStatus: document.getElementById('footerStatus'),
+};
+
+// Build the meter bars
+for (let i = 0; i < METER_BARS; i++) {
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  els.meter.appendChild(bar);
+}
+const meterBars = Array.from(els.meter.children);
+
+// ============================================================
+//  STATE
+// ============================================================
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let micSource = null;
+let micProcessor = null;
+let nextPlaybackTime = 0;
+let connected = false;
+let clientAudioBuffer = [];        // accumulates samples before slicing
+
+// ============================================================
+//  UI HELPERS
+// ============================================================
+function setState(state) {
+  els.dial.className = 'dial ' + state;
+  els.stateLabel.textContent = state;
+}
+
+function setFooter(text) {
+  els.footerStatus.textContent = text;
+}
+
+function addCaption(text) {
+  const div = document.createElement('div');
+  div.className = 'line';
+  div.textContent = text;
+  els.captions.appendChild(div);
+  els.captions.scrollTop = els.captions.scrollHeight;
+}
+
+function updateMeter(level) {
+  const litCount = Math.round(level * METER_BARS);
+  meterBars.forEach((bar, i) => {
+    const active = i < litCount;
+    bar.style.height = active ? (6 + Math.random() * 18) + 'px' : '4px';
+    bar.style.background = active ? 'var(--teal)' : 'var(--surface-line)';
+  });
+}
+
+// ============================================================
+//  AUDIO PROCESSING HELPERS
+// ============================================================
+
+// Downsample from any input rate to 16 kHz (linear interpolation)
+function downsampleTo16k(float32Audio, inRate) {
+  if (inRate === SAMPLE_RATE) return float32Audio;
+  const ratio = inRate / SAMPLE_RATE;
+  const outLength = Math.round(float32Audio.length / ratio);
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const srcIndex = i * ratio;
+    const i0 = Math.floor(srcIndex);
+    const i1 = Math.min(i0 + 1, float32Audio.length - 1);
+    const frac = srcIndex - i0;
+    out[i] = float32Audio[i0] * (1 - frac) + float32Audio[i1] * frac;
+  }
+  return out;
+}
+
+// Float32 → base64 PCM16 (for transmission)
+function float32ToBase64PCM16(float32Audio) {
+  const pcm16 = new Int16Array(float32Audio.length);
+  for (let i = 0; i < float32Audio.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Audio[i]));
+    pcm16[i] = s < 0 ? s * 32768 : s * 32767;
+  }
+  const bytes = new Uint8Array(pcm16.buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+// Base64 PCM16 → Float32 (for playback)
+function base64PCM16ToFloat32(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const pcm16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768;
+  return float32;
+}
+
+// Play audio chunk (assumes 24 kHz for TTS output)
+function playAudioChunk(float32Audio, sampleRate) {
+  const buffer = audioCtx.createBuffer(1, float32Audio.length, sampleRate);
+  buffer.copyToChannel(float32Audio, 0);
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+  const startAt = Math.max(now, nextPlaybackTime);
+  source.start(startAt);
+  nextPlaybackTime = startAt + buffer.duration;
+}
+
+// ============================================================
+//  MICROPHONE CONTROL (with client-side buffering)
+// ============================================================
+
+async function startMic() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
+
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  micSource = audioCtx.createMediaStreamSource(micStream);
+
+  // Use a standard processor buffer size (4096); we'll accumulate and slice.
+  micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+  micSource.connect(micProcessor);
+
+  // Connect to a silent gain to keep the graph alive without echo.
+  const silentGain = audioCtx.createGain();
+  silentGain.gain.value = 0;
+  micProcessor.connect(silentGain);
+  silentGain.connect(audioCtx.destination);
+
+  micProcessor.onaudioprocess = (event) => {
+    const input = event.inputBuffer.getChannelData(0);
+
+    // Compute RMS for the level meter
+    let sum = 0;
+    for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+    const rms = Math.sqrt(sum / input.length);
+    updateMeter(Math.min(1, rms * 6));
+
+    if (!connected || ws.readyState !== WebSocket.OPEN) return;
+
+    // 1. Downsample to 16 kHz (e.g., 4096 samples → ~1365 samples)
+    const downsampled = downsampleTo16k(input, audioCtx.sampleRate);
+
+    // 2. Push into our buffer
+    for (let i = 0; i < downsampled.length; i++) {
+      clientAudioBuffer.push(downsampled[i]);
+    }
+
+    // 3. While we have at least 512 samples, slice and send
+    while (clientAudioBuffer.length >= VAD_CHUNK_SIZE) {
+      const chunk = new Float32Array(VAD_CHUNK_SIZE);
+      for (let i = 0; i < VAD_CHUNK_SIZE; i++) {
+        chunk[i] = clientAudioBuffer.shift();
+      }
+      const b64 = float32ToBase64PCM16(chunk);
+      ws.send(JSON.stringify({ type: 'audio_chunk', audio_b64: b64 }));
+    }
+  };
+}
+
+function stopMic() {
+  if (micProcessor) {
+    micProcessor.disconnect();
+    micProcessor.onaudioprocess = null;
+  }
+  if (micSource) micSource.disconnect();
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+  }
+  micProcessor = micSource = micStream = null;
+  clientAudioBuffer = [];   // clear any leftover samples
+  updateMeter(0);
+}
+
+// ============================================================
+//  WEBSOCKET CONNECTION
+// ============================================================
+
+async function connect() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  nextPlaybackTime = 0;
+
+  ws = new WebSocket(els.wsUrl.value);
+
+  ws.onopen = async () => {
+    connected = true;
+    setFooter('Connected. Requesting microphone access...');
+    els.connectBtn.textContent = 'Disconnect';
+    els.resetBtn.disabled = false;
+    try {
+      await startMic();
+      setFooter('Connected -- listening.');
+    } catch (e) {
+      setFooter('Microphone access failed: ' + e.message);
+    }
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+      case 'status':
+        setState(msg.state);
+        break;
+      case 'caption':
+        addCaption(msg.text);
+        break;
+      case 'audio_chunk': {
+        const float32 = base64PCM16ToFloat32(msg.audio_b64);
+        playAudioChunk(float32, msg.sample_rate || 24000);
+        break;
+      }
+      case 'turn_done':
+        break;
+      case 'error':
+        setFooter('Server error: ' + msg.message);
+        break;
+      default:
+        console.warn('Unknown message type:', msg.type);
+    }
+  };
+
+  ws.onclose = () => {
+    connected = false;
+    setState('offline');
+    setFooter('Disconnected.');
+    els.connectBtn.textContent = 'Connect';
+    els.resetBtn.disabled = true;
+    stopMic();
+  };
+
+  ws.onerror = () => {
+    setFooter('WebSocket error -- check the server is running and the URL is correct.');
+  };
+}
+
+function disconnect() {
+  if (ws) ws.close();
+}
+
+// ============================================================
+//  EVENT LISTENERS
+// ============================================================
+
+els.connectBtn.addEventListener('click', () => {
+  if (connected) disconnect(); else connect();
+});
+
+els.resetBtn.addEventListener('click', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'reset' }));
+    els.captions.innerHTML = '';
+  }
+});
+</script>
+</body>
+</html>
